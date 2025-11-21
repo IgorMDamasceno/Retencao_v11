@@ -4476,13 +4476,17 @@ function buildLinkRouterUrlIndex_(links) {
   };
 }
 
-function fetchLinkRouterRoute_(companyId, domainId, slug) {
+function fetchLinkRouterRoute_(companyId, domainId, slug, allowDomainFallback) {
   var params = {
     company_id: companyId,
     domain: domainId,
     slug: slug
   };
-  return callLinkRouterApi_('/api/link_router/route', 'get', params, null);
+  var response = callLinkRouterApi_('/api/link_router/route', 'get', params, null);
+  if (allowDomainFallback !== false && domainId && isLinkRouterDomainOwnershipError_(response)) {
+    response = callLinkRouterApi_('/api/link_router/route', 'get', { company_id: companyId, slug: slug }, null);
+  }
+  return response;
 }
 
 function buildLinkRouterRequestOptions_(path, method, qs, payload) {
@@ -4527,6 +4531,13 @@ function parseLinkRouterResponse_(response) {
   return { ok: ok, statusCode: statusCode, body: body };
 }
 
+function isLinkRouterDomainOwnershipError_(response) {
+  var message = formatLinkRouterError_(response);
+  var normalized = normalizeLookupKey_(message);
+  if (!normalized) return false;
+  return normalized.indexOf('domain') >= 0 && (normalized.indexOf('pertence') >= 0 || normalized.indexOf('naopertence') >= 0);
+}
+
 function fetchLinkRouterRoutesBatch_(items) {
   if (!items || !items.length) {
     return [];
@@ -4550,6 +4561,13 @@ function fetchLinkRouterRoutesBatch_(items) {
       }
     });
   }
+  responses = responses.map(function (response, idx) {
+    var item = items[idx];
+    if (!item || !item.domainId || !isLinkRouterDomainOwnershipError_(response)) {
+      return response;
+    }
+    return fetchLinkRouterRoute_(item.companyId, null, item.routeSlug, false);
+  });
   return responses;
 }
 
