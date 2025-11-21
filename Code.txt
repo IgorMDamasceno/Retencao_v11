@@ -284,11 +284,13 @@ function getDashboardData(params) {
   const snapshot = getConfigSnapshot_();
   const operationName = String(params.operation || '').trim();
   const trafficType = String(params.traffic || '').trim();
+  const operationKey = normalizeLookupKey_(operationName);
+  const trafficKey = normalizeLookupKey_(trafficType);
   if (!operationName) throw new Error('Selecione a operação.');
   if (!trafficType) throw new Error('Selecione o tráfego.');
   const requestedRouteSlug = String(params.routeSlug || '').trim();
   const requestedDomainId = String(params.domainId || '').trim();
-  const opTrafficKey = operationName + '\u0000' + trafficType;
+  const opTrafficKey = operationKey + '\u0000' + trafficKey;
   const integrationCandidates = (snapshot.operationIntegrationsByOperationTraffic && snapshot.operationIntegrationsByOperationTraffic[opTrafficKey]) ? snapshot.operationIntegrationsByOperationTraffic[opTrafficKey] : [];
   var integrationConfig = null;
   var selectedRouteSlug = requestedRouteSlug;
@@ -331,11 +333,11 @@ function getDashboardData(params) {
     selectedRouteSlug = '';
     selectedRouteDomainId = '';
   }
-  const operationUrls = snapshot.operationsByName[operationName];
+  const operationUrls = snapshot.operationsByName[operationKey];
   if (!operationUrls || !operationUrls.length) {
     throw new Error('Operação sem URLs configuradas.');
   }
-  const trafficSources = snapshot.trafficByType[trafficType] || [];
+  const trafficSources = snapshot.trafficByType[trafficKey] || [];
   if (!trafficSources.length) {
     throw new Error('Tráfego sem utm_source configurada.');
   }
@@ -2401,11 +2403,12 @@ function getConfigSnapshot_() {
   const revValues = getSheetValues_(revSheet);
 
   const operationRows = operationValues.rows.map(function (row) {
+    var operation = normalizeText_(row.operacao);
     return {
       id: row.id,
-      operation: row.operacao,
-      url: row.url,
-      note: row.observacao
+      operation: operation,
+      url: normalizeText_(row.url),
+      note: normalizeText_(row.observacao)
     };
   });
 
@@ -2413,19 +2416,25 @@ function getConfigSnapshot_() {
   operationRows.forEach(function (row) {
     var name = row.operation;
     if (!name) return;
-    if (!operationsByName[name]) operationsByName[name] = [];
-    operationsByName[name].push(row.url);
+    var opKey = normalizeLookupKey_(name);
+    if (!operationsByName[opKey]) operationsByName[opKey] = [];
+    operationsByName[opKey].push(row.url);
   });
 
   const operationIntegrationRows = operationIntegrationValues.rows.map(function (row) {
     var rawActive = row.ativo;
+    var operation = normalizeText_(row.operacao);
+    var trafficType = normalizeText_(row.tipotrafego);
+    var companyId = normalizeText_(row.empresaid);
+    var domainId = normalizeText_(row.dominioid);
+    var routeSlug = normalizeText_(row.slugrota);
     return {
       id: row.id,
-      operation: row.operacao,
-      trafficType: row.tipotrafego,
-      companyId: row.empresaid,
-      domainId: row.dominioid,
-      routeSlug: row.slugrota,
+      operation: operation,
+      trafficType: trafficType,
+      companyId: companyId,
+      domainId: domainId,
+      routeSlug: routeSlug,
       active: coerceBoolean_(rawActive)
     };
   });
@@ -2433,12 +2442,13 @@ function getConfigSnapshot_() {
   const operationIntegrationsByOperationTraffic = {};
   operationIntegrationRows.forEach(function (row) {
     if (!row.operation) return;
-    if (!operationIntegrationsByOperation[row.operation]) {
-      operationIntegrationsByOperation[row.operation] = [];
+    var opKey = normalizeLookupKey_(row.operation);
+    if (!operationIntegrationsByOperation[opKey]) {
+      operationIntegrationsByOperation[opKey] = [];
     }
-    operationIntegrationsByOperation[row.operation].push(row);
-    var trafficKey = row.trafficType || '';
-    var opTrafficKey = row.operation + '\u0000' + trafficKey;
+    operationIntegrationsByOperation[opKey].push(row);
+    var trafficKey = normalizeLookupKey_(row.trafficType);
+    var opTrafficKey = opKey + '\u0000' + trafficKey;
     if (!operationIntegrationsByOperationTraffic[opTrafficKey]) {
       operationIntegrationsByOperationTraffic[opTrafficKey] = [];
     }
@@ -2460,15 +2470,17 @@ function getConfigSnapshot_() {
   const trafficRows = trafficValues.rows.map(function (row) {
     return {
       id: row.id,
-      type: row.tipo,
-      source: row.utm_source
+      type: normalizeText_(row.tipo),
+      source: normalizeText_(row.utm_source)
     };
   });
   const trafficByType = {};
   trafficRows.forEach(function (row) {
-    if (!row.type || !row.source) return;
-    if (!trafficByType[row.type]) trafficByType[row.type] = [];
-    trafficByType[row.type].push(row.source);
+    var typeKey = normalizeLookupKey_(row.type);
+    var sourceValue = normalizeText_(row.source);
+    if (!typeKey || !sourceValue) return;
+    if (!trafficByType[typeKey]) trafficByType[typeKey] = [];
+    trafficByType[typeKey].push(sourceValue);
   });
 
   const revshareRows = revValues.rows.map(function (row) {
@@ -3261,6 +3273,14 @@ function normalizeKey_(value) {
     .replace(/[^a-z0-9]+/g, '');
 }
 
+function normalizeText_(value) {
+  return String(value == null ? '' : value).trim();
+}
+
+function normalizeLookupKey_(value) {
+  return normalizeText_(value).toLowerCase();
+}
+
 function pickValue_(row, idxMap, key) {
   if (!idxMap) return '';
   var index = idxMap[key];
@@ -3802,25 +3822,35 @@ function runLinkRouterAutoSync() {
   var failures = [];
 
   integrations.forEach(function (integration) {
-    var trafficType = integration.trafficType;
-    var sources = trafficByType[trafficType] || [];
+    var operationName = normalizeText_(integration.operation);
+    var trafficType = normalizeText_(integration.trafficType);
+    var trafficKey = normalizeLookupKey_(trafficType);
+    var domainId = normalizeText_(integration.domainId);
+    var routeSlug = normalizeText_(integration.routeSlug);
+    var normalizedIntegration = Object.assign({}, integration, {
+      operation: operationName,
+      trafficType: trafficType,
+      domainId: domainId,
+      routeSlug: routeSlug
+    });
+    var sources = trafficByType[trafficKey] || [];
     if (!sources.length) {
       var error = new Error('Nenhuma utm_source configurada para o tráfego vinculado.');
       failures.push({
-        operation: integration.operation,
+        operation: operationName,
         traffic: trafficType,
         message: error.message
       });
-      logLinkRouterAutoSyncFailure_(integration, trafficType, error);
+      logLinkRouterAutoSyncFailure_(normalizedIntegration, trafficType, error);
       return;
     }
     try {
       var autoRange = getLinkRouterAutoSyncDateRange_();
       var request = {
-        operation: integration.operation,
+        operation: operationName,
         traffic: trafficType,
-        routeSlug: integration.routeSlug,
-        domainId: integration.domainId,
+        routeSlug: routeSlug,
+        domainId: domainId,
         window: 'day',
         mode: 'auto'
       };
@@ -3830,7 +3860,7 @@ function runLinkRouterAutoSync() {
       }
       var result = syncLinkRouterDistribution(request);
       successes.push({
-        operation: integration.operation,
+        operation: operationName,
         traffic: trafficType,
         linksUpdated: result && result.linksUpdated ? result.linksUpdated : 0,
         unmatchedLinks: result && result.unmatchedLinks ? result.unmatchedLinks.length : 0,
@@ -3838,11 +3868,11 @@ function runLinkRouterAutoSync() {
       });
     } catch (err) {
       failures.push({
-        operation: integration.operation,
+        operation: operationName,
         traffic: trafficType,
         message: err && err.message ? err.message : String(err)
       });
-      logLinkRouterAutoSyncFailure_(integration, trafficType, err);
+      logLinkRouterAutoSyncFailure_(normalizedIntegration, trafficType, err);
     }
   });
 
