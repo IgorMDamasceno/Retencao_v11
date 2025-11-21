@@ -28,6 +28,7 @@ const DISTRIBUTION_SOFTMAX_TAU = 0.30;
 const LINK_ROUTER_AUTO_SYNC_CROSS_DAY_WINDOW_HOURS = 4;
 const LINK_ROUTER_AUTO_SYNC_MAX_RUNTIME_MS = 25 * 60 * 1000;
 const LINK_ROUTER_MANUAL_AUTO_SYNC_MAX_RUNTIME_MS = 5 * 60 * 1000;
+const LINK_ROUTER_AUTO_SYNC_RUNTIME_BUFFER_MS = 20 * 1000;
 const LINK_ROUTER_AUTO_SYNC_STATE_KEY = 'LINK_ROUTER_AUTO_SYNC_STATE';
 const LINK_ROUTER_AUTO_SYNC_BATCH_SIZE = 2;
 
@@ -286,6 +287,9 @@ function updateRevShare(payload) {
 function getDashboardData(params) {
   if (!params) throw new Error('Parâmetros inválidos.');
   var runtimeCache = params.runtimeCache || null;
+  if (runtimeCache && !runtimeCache.routeResponses) {
+    runtimeCache.routeResponses = {};
+  }
   const snapshot = params.snapshot || getConfigSnapshot_();
   const operationName = String(params.operation || '').trim();
   const trafficType = String(params.traffic || '').trim();
@@ -3717,9 +3721,14 @@ function syncLinkRouterDistribution(request) {
   var historyOriginSuffix = executionMode === 'auto' ? ' (Execução automática)' : '';
 
   var shareState = buildLinkRouterShareState_(distribution);
-  var routeResponse = request.routeResponse;
+  var routeKey = integration.companyId + '\u0000' + integration.domainId + '\u0000' + integration.routeSlug;
+  var routeCache = runtimeCache && runtimeCache.routeResponses ? runtimeCache.routeResponses : null;
+  var routeResponse = request.routeResponse || (routeCache && routeCache[routeKey]);
   if (!routeResponse) {
     routeResponse = fetchLinkRouterRoute_(integration.companyId, integration.domainId, integration.routeSlug);
+    if (routeResponse && routeCache) {
+      routeCache[routeKey] = routeResponse;
+    }
   }
   if (!routeResponse.ok || !routeResponse.body || routeResponse.body.status !== 'success') {
     throw new Error('Falha ao consultar a rota na API: ' + formatLinkRouterError_(routeResponse));
@@ -3857,11 +3866,17 @@ function runLinkRouterAutoSync(options) {
   var startTime = new Date();
   var continuationScheduled = false;
   var lastIndexProcessed = startIndex - 1;
-  var runtimeCache = {};
+  var runtimeCache = { routeResponses: {} };
 
   var batchSize = Math.max(1, Number(LINK_ROUTER_AUTO_SYNC_BATCH_SIZE) || 1);
   var i = startIndex;
   while (i < integrations.length) {
+    var elapsedBeforeBatch = new Date().getTime() - startTime.getTime();
+    if (elapsedBeforeBatch >= Math.max(0, maxRuntimeMs - LINK_ROUTER_AUTO_SYNC_RUNTIME_BUFFER_MS)) {
+      scheduleLinkRouterAutoSyncContinuation_(i, integrationVersion);
+      continuationScheduled = true;
+      break;
+    }
     var batch = integrations.slice(i, i + batchSize);
     var runnable = [];
 
@@ -3926,6 +3941,10 @@ function runLinkRouterAutoSync(options) {
           return;
         }
         item.request.routeResponse = responses[idx];
+        var cacheKey = item.normalizedIntegration.companyId + '\u0000' + item.normalizedIntegration.domainId + '\u0000' + item.normalizedIntegration.routeSlug;
+        if (runtimeCache.routeResponses) {
+          runtimeCache.routeResponses[cacheKey] = responses[idx];
+        }
         try {
           var result = syncLinkRouterDistribution(item.request);
           successes.push({
@@ -3946,7 +3965,7 @@ function runLinkRouterAutoSync(options) {
 
         lastIndexProcessed = item.globalIndex;
         var elapsed = new Date().getTime() - startTime.getTime();
-        if (elapsed >= maxRuntimeMs && item.globalIndex < integrations.length - 1) {
+        if (elapsed >= Math.max(0, maxRuntimeMs - LINK_ROUTER_AUTO_SYNC_RUNTIME_BUFFER_MS) && item.globalIndex < integrations.length - 1) {
           scheduleLinkRouterAutoSyncContinuation_(item.globalIndex + 1, integrationVersion);
           continuationScheduled = true;
           return;
@@ -4576,24 +4595,30 @@ function fetchLinkRouterRoutesBatch_(items) {
   if (!items || !items.length) {
     return [];
   }
-  var requests = items.map(function (item) {
-    var params = { company_id: item.companyId, domain: item.domainId, slug: item.routeSlug };
-    var req = buildLinkRouterRequestOptions_('/api/link_router/route', 'get', params, null);
-    return Object.assign({ url: req.url }, req.options);
-  });
   var responses = [];
-  try {
-    responses = UrlFetchApp.fetchAll(requests).map(function (response) {
-      return parseLinkRouterResponse_(response);
+  var chunkSize = Math.min(10, Math.max(1, items.length));
+  for (var i = 0; i < items.length; i += chunkSize) {
+    var slice = items.slice(i, i + chunkSize);
+    var requests = slice.map(function (item) {
+      var params = { company_id: item.companyId, domain: item.domainId, slug: item.routeSlug };
+      var req = buildLinkRouterRequestOptions_('/api/link_router/route', 'get', params, null);
+      return Object.assign({ url: req.url }, req.options);
     });
-  } catch (err) {
-    responses = items.map(function (item) {
-      try {
-        return callLinkRouterApi_('/api/link_router/route', 'get', { company_id: item.companyId, domain: item.domainId, slug: item.routeSlug }, null);
-      } catch (inner) {
-        return { ok: false, statusCode: 0, body: { status: 'error', data: inner && inner.message ? inner.message : String(inner) } };
-      }
-    });
+    try {
+      var batchResponses = UrlFetchApp.fetchAll(requests).map(function (response) {
+        return parseLinkRouterResponse_(response);
+      });
+      responses = responses.concat(batchResponses);
+    } catch (err) {
+      var fallback = slice.map(function (item) {
+        try {
+          return callLinkRouterApi_('/api/link_router/route', 'get', { company_id: item.companyId, domain: item.domainId, slug: item.routeSlug }, null);
+        } catch (inner) {
+          return { ok: false, statusCode: 0, body: { status: 'error', data: inner && inner.message ? inner.message : String(inner) } };
+        }
+      });
+      responses = responses.concat(fallback);
+    }
   }
   responses = responses.map(function (response, idx) {
     var item = items[idx];
