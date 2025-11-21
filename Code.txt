@@ -284,7 +284,8 @@ function updateRevShare(payload) {
 
 function getDashboardData(params) {
   if (!params) throw new Error('Parâmetros inválidos.');
-  const snapshot = getConfigSnapshot_();
+  var runtimeCache = params.runtimeCache || null;
+  const snapshot = params.snapshot || getConfigSnapshot_();
   const operationName = String(params.operation || '').trim();
   const trafficType = String(params.traffic || '').trim();
   const operationKey = normalizeLookupKey_(operationName);
@@ -347,6 +348,7 @@ function getDashboardData(params) {
   var startDate = params.startDate ? parseDate_(params.startDate) : null;
   var endDate = params.endDate ? parseDate_(params.endDate) : null;
   const window = params.urlWindow || 'day';
+  var cacheKey = [operationKey, trafficKey, window, startDate ? formatDateISO_(startDate) : '', endDate ? formatDateISO_(endDate) : ''].join('|');
   if (startDate && endDate && startDate.getTime() > endDate.getTime()) {
     throw new Error('A data inicial não pode ser maior que a final.');
   }
@@ -355,6 +357,7 @@ function getDashboardData(params) {
     startDate = today;
     endDate = today;
   }
+  var cached = runtimeCache && runtimeCache.dashboard && runtimeCache.dashboard[cacheKey];
   var routeLinkInfo = null;
   if (integrationConfig && integrationConfig.companyId && integrationConfig.domainId && integrationConfig.routeSlug) {
     var routeResponse = fetchLinkRouterRoute_(integrationConfig.companyId, integrationConfig.domainId, integrationConfig.routeSlug);
@@ -365,15 +368,15 @@ function getDashboardData(params) {
       Logger.log('[Link Router] Falha ao carregar rota "' + integrationConfig.routeSlug + '": ' + formatLinkRouterError_(routeResponse));
     }
   }
-  const baseRows = loadBaseData_(operationUrls, trafficSources);
+  var baseRows = cached ? cached.baseRows : loadBaseData_(operationUrls, trafficSources);
   if (!baseRows.length) {
     return buildEmptyDashboardResponse_();
   }
-  const filteredRows = filterRowsByDate_(baseRows, startDate, endDate);
+  var filteredRows = cached ? cached.filteredRows : filterRowsByDate_(baseRows, startDate, endDate);
   if (!filteredRows.length) {
     return buildEmptyDashboardResponse_();
   }
-  const hoursInfo = getHourTimeline_(filteredRows);
+  var hoursInfo = cached ? cached.hoursInfo : getHourTimeline_(filteredRows);
   if (!hoursInfo.allHours.length) {
     return buildEmptyDashboardResponse_();
   }
@@ -392,15 +395,29 @@ function getDashboardData(params) {
       return false;
     });
   }
-  const urlRows = filterRowsForWindow_(filteredRows, hoursInfo, window);
-  const siteSummary = buildSiteSummary_(
+  var urlRows = cached ? cached.urlRows : filterRowsForWindow_(filteredRows, hoursInfo, window);
+  var siteSummary = cached ? cached.siteSummary : buildSiteSummary_(
     filteredRows,
     hoursInfo,
     snapshot.revshareMap,
     urlRows
   );
-  const urlSummary = buildUrlSummary_(urlRows, snapshot.revshareMap);
-  const detailed = buildDetailedAnalysis_(filteredRows, hoursInfo, snapshot.revshareMap);
+  var urlSummary = cached ? cached.urlSummary : buildUrlSummary_(urlRows, snapshot.revshareMap);
+  var detailed = cached ? cached.detailed : buildDetailedAnalysis_(filteredRows, hoursInfo, snapshot.revshareMap);
+  if (!cached && runtimeCache) {
+    if (!runtimeCache.dashboard) {
+      runtimeCache.dashboard = {};
+    }
+    runtimeCache.dashboard[cacheKey] = {
+      baseRows: baseRows,
+      filteredRows: filteredRows,
+      hoursInfo: hoursInfo,
+      urlRows: urlRows,
+      siteSummary: siteSummary,
+      urlSummary: urlSummary,
+      detailed: detailed
+    };
+  }
 
   var savedControls = getDistributionControlsConfig_(operationName, trafficType, selectedRouteSlug, selectedRouteDomainId);
   var savedMinimums = getDistributionMinimumsConfig_(operationName, trafficType, selectedRouteSlug, selectedRouteDomainId);
@@ -3832,6 +3849,7 @@ function runLinkRouterAutoSync() {
   var startTime = new Date();
   var continuationScheduled = false;
   var lastIndexProcessed = startIndex - 1;
+  var runtimeCache = {};
 
   var batchSize = Math.max(1, Number(LINK_ROUTER_AUTO_SYNC_BATCH_SIZE) || 1);
   var i = startIndex;
@@ -3870,7 +3888,9 @@ function runLinkRouterAutoSync() {
         routeSlug: routeSlug,
         domainId: domainId,
         window: 'day',
-        mode: 'auto'
+        mode: 'auto',
+        snapshot: snapshot,
+        runtimeCache: runtimeCache
       };
       if (autoRange) {
         request.startDate = autoRange.startDate;
