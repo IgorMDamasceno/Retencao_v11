@@ -365,7 +365,14 @@ function getDashboardData(params) {
   var cached = runtimeCache && runtimeCache.dashboard && runtimeCache.dashboard[cacheKey];
   var routeLinkInfo = null;
   if (integrationConfig && integrationConfig.companyId && integrationConfig.domainId && integrationConfig.routeSlug) {
-    var routeResponse = fetchLinkRouterRoute_(integrationConfig.companyId, integrationConfig.domainId, integrationConfig.routeSlug);
+    var routeKey = integrationConfig.companyId + '\u0000' + integrationConfig.domainId + '\u0000' + integrationConfig.routeSlug;
+    var routeResponse = params.routeResponse || (runtimeCache && runtimeCache.routeResponses && runtimeCache.routeResponses[routeKey]);
+    if (!routeResponse) {
+      routeResponse = fetchLinkRouterRoute_(integrationConfig.companyId, integrationConfig.domainId, integrationConfig.routeSlug);
+      if (runtimeCache && runtimeCache.routeResponses) {
+        runtimeCache.routeResponses[routeKey] = routeResponse;
+      }
+    }
     if (routeResponse && routeResponse.ok && routeResponse.body && routeResponse.body.status === 'success') {
       var routeData = routeResponse.body.data || {};
       routeLinkInfo = buildLinkRouterUrlIndex_(routeData.links || []);
@@ -3677,6 +3684,7 @@ function syncLinkRouterDistribution(request) {
   if (!request) {
     throw new Error('Parâmetros inválidos.');
   }
+  var runtimeCache = request.runtimeCache || null;
   var operation = String(request.operation || '').trim();
   var traffic = String(request.traffic || '').trim();
   var routeSlug = String(request.routeSlug || '').trim();
@@ -3694,7 +3702,9 @@ function syncLinkRouterDistribution(request) {
     domainId: domainId,
     startDate: request.startDate || '',
     endDate: request.endDate || '',
-    urlWindow: request.window || 'day'
+    urlWindow: request.window || 'day',
+    runtimeCache: runtimeCache,
+    routeResponse: request.routeResponse
   };
   if (request.distribution) {
     params.distribution = request.distribution;
