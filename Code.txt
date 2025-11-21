@@ -27,6 +27,7 @@ const DISTRIBUTION_RPS_EXPONENT = 2.7;
 const DISTRIBUTION_SOFTMAX_TAU = 0.30;
 const LINK_ROUTER_AUTO_SYNC_CROSS_DAY_WINDOW_HOURS = 4;
 const LINK_ROUTER_AUTO_SYNC_MAX_RUNTIME_MS = 25 * 60 * 1000;
+const LINK_ROUTER_MANUAL_AUTO_SYNC_MAX_RUNTIME_MS = 5 * 60 * 1000;
 const LINK_ROUTER_AUTO_SYNC_STATE_KEY = 'LINK_ROUTER_AUTO_SYNC_STATE';
 const LINK_ROUTER_AUTO_SYNC_BATCH_SIZE = 2;
 
@@ -3835,7 +3836,14 @@ function parseLinkRouterId_(value) {
   return isNaN(num) ? value : num;
 }
 
-function runLinkRouterAutoSync() {
+function runLinkRouterAutoSync(options) {
+  options = options || {};
+  var maxRuntimeMs = Number(options.maxRuntimeMs) || LINK_ROUTER_AUTO_SYNC_MAX_RUNTIME_MS;
+  if (!isFinite(maxRuntimeMs) || maxRuntimeMs <= 0) {
+    maxRuntimeMs = LINK_ROUTER_AUTO_SYNC_MAX_RUNTIME_MS;
+  }
+  var forceRestart = !!options.forceRestart;
+
   var snapshot = getConfigSnapshot_();
   var integrations = (snapshot.operationIntegrationRows || []).filter(function (row) {
     return row && row.active && row.operation && row.companyId && row.domainId && row.routeSlug && row.trafficType;
@@ -3844,7 +3852,7 @@ function runLinkRouterAutoSync() {
   var successes = [];
   var failures = [];
   var integrationVersion = buildLinkRouterIntegrationVersion_(integrations);
-  var state = getLinkRouterAutoSyncState_();
+  var state = forceRestart ? { nextIndex: 0, version: '' } : getLinkRouterAutoSyncState_();
   var startIndex = state.version === integrationVersion ? Math.max(0, Number(state.nextIndex) || 0) : 0;
   var startTime = new Date();
   var continuationScheduled = false;
@@ -3938,7 +3946,7 @@ function runLinkRouterAutoSync() {
 
         lastIndexProcessed = item.globalIndex;
         var elapsed = new Date().getTime() - startTime.getTime();
-        if (elapsed >= LINK_ROUTER_AUTO_SYNC_MAX_RUNTIME_MS && item.globalIndex < integrations.length - 1) {
+        if (elapsed >= maxRuntimeMs && item.globalIndex < integrations.length - 1) {
           scheduleLinkRouterAutoSyncContinuation_(item.globalIndex + 1, integrationVersion);
           continuationScheduled = true;
           return;
@@ -3966,6 +3974,12 @@ function runLinkRouterAutoSync() {
     continuationScheduled: continuationScheduled,
     remainingIntegrations: continuationScheduled ? Math.max(0, integrations.length - (lastIndexProcessed + 1)) : 0
   };
+}
+
+function startLinkRouterAutoSyncNow() {
+  clearLinkRouterAutoSyncState_();
+  var manualRuntimeCap = Math.min(LINK_ROUTER_AUTO_SYNC_MAX_RUNTIME_MS, LINK_ROUTER_MANUAL_AUTO_SYNC_MAX_RUNTIME_MS);
+  return runLinkRouterAutoSync({ forceRestart: true, maxRuntimeMs: manualRuntimeCap });
 }
 
 function buildLinkRouterIntegrationVersion_(integrations) {
