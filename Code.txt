@@ -26,6 +26,8 @@ const DISTRIBUTION_ECPM_EXPONENT = 1.0;
 const DISTRIBUTION_RPS_EXPONENT = 2.7;
 const DISTRIBUTION_SOFTMAX_TAU = 0.30;
 const LINK_ROUTER_AUTO_SYNC_CROSS_DAY_WINDOW_HOURS = 4;
+const LINK_ROUTER_AUTO_SYNC_MAX_RUNTIME_MS = 25 * 60 * 1000;
+const LINK_ROUTER_AUTO_SYNC_STATE_KEY = 'LINK_ROUTER_AUTO_SYNC_STATE';
 
 function doGet() {
   return HtmlService.createTemplateFromFile('index')
@@ -3820,8 +3822,15 @@ function runLinkRouterAutoSync() {
   var trafficByType = snapshot.trafficByType || {};
   var successes = [];
   var failures = [];
+  var integrationVersion = buildLinkRouterIntegrationVersion_(integrations);
+  var state = getLinkRouterAutoSyncState_();
+  var startIndex = state.version === integrationVersion ? Math.max(0, Number(state.nextIndex) || 0) : 0;
+  var startTime = new Date();
+  var continuationScheduled = false;
+  var lastIndexProcessed = startIndex - 1;
 
-  integrations.forEach(function (integration) {
+  for (var i = startIndex; i < integrations.length; i++) {
+    var integration = integrations[i];
     var operationName = normalizeText_(integration.operation);
     var trafficType = normalizeText_(integration.trafficType);
     var trafficKey = normalizeLookupKey_(trafficType);
@@ -3842,7 +3851,7 @@ function runLinkRouterAutoSync() {
         message: error.message
       });
       logLinkRouterAutoSyncFailure_(normalizedIntegration, trafficType, error);
-      return;
+      continue;
     }
     try {
       var autoRange = getLinkRouterAutoSyncDateRange_();
@@ -3874,15 +3883,74 @@ function runLinkRouterAutoSync() {
       });
       logLinkRouterAutoSyncFailure_(normalizedIntegration, trafficType, err);
     }
-  });
+
+    lastIndexProcessed = i;
+
+    var elapsed = new Date().getTime() - startTime.getTime();
+    if (elapsed >= LINK_ROUTER_AUTO_SYNC_MAX_RUNTIME_MS && i < integrations.length - 1) {
+      scheduleLinkRouterAutoSyncContinuation_(i + 1, integrationVersion);
+      continuationScheduled = true;
+      break;
+    }
+  }
+
+  if (!continuationScheduled) {
+    clearLinkRouterAutoSyncState_();
+  }
 
   updateLinkRouterAutoSyncTrigger_(snapshot);
 
   return {
     timestamp: new Date(),
     successes: successes,
-    failures: failures
+    failures: failures,
+    continuationScheduled: continuationScheduled,
+    remainingIntegrations: continuationScheduled ? Math.max(0, integrations.length - (lastIndexProcessed + 1)) : 0
   };
+}
+
+function buildLinkRouterIntegrationVersion_(integrations) {
+  if (!integrations || !integrations.length) {
+    return '';
+  }
+  return integrations.map(function (integration) {
+    var id = integration && integration.id ? String(integration.id).trim().toLowerCase() : '';
+    var slug = integration && integration.routeSlug ? String(integration.routeSlug).trim().toLowerCase() : '';
+    var op = integration && integration.operation ? String(integration.operation).trim().toLowerCase() : '';
+    var traffic = integration && integration.trafficType ? String(integration.trafficType).trim().toLowerCase() : '';
+    var domain = integration && integration.domainId ? String(integration.domainId).trim().toLowerCase() : '';
+    var company = integration && integration.companyId ? String(integration.companyId).trim().toLowerCase() : '';
+    return [id, slug, op, traffic, domain, company].join('|');
+  }).join('~');
+}
+
+function getLinkRouterAutoSyncState_() {
+  var raw = PropertiesService.getScriptProperties().getProperty(LINK_ROUTER_AUTO_SYNC_STATE_KEY);
+  if (!raw) {
+    return { nextIndex: 0, version: '' };
+  }
+  try {
+    var parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : { nextIndex: 0, version: '' };
+  } catch (err) {
+    return { nextIndex: 0, version: '' };
+  }
+}
+
+function scheduleLinkRouterAutoSyncContinuation_(nextIndex, integrationVersion) {
+  var state = {
+    nextIndex: Math.max(0, Number(nextIndex) || 0),
+    version: integrationVersion || ''
+  };
+  PropertiesService.getScriptProperties().setProperty(LINK_ROUTER_AUTO_SYNC_STATE_KEY, JSON.stringify(state));
+  ScriptApp.newTrigger('runLinkRouterAutoSync')
+    .timeBased()
+    .after(1 * 60 * 1000)
+    .create();
+}
+
+function clearLinkRouterAutoSyncState_() {
+  PropertiesService.getScriptProperties().deleteProperty(LINK_ROUTER_AUTO_SYNC_STATE_KEY);
 }
 
 function getLinkRouterAutoSyncDateRange_(now) {
