@@ -26,6 +26,11 @@ const DISTRIBUTION_ECPM_EXPONENT = 1.0;
 const DISTRIBUTION_RPS_EXPONENT = 2.7;
 const DISTRIBUTION_SOFTMAX_TAU = 0.30;
 const LINK_ROUTER_AUTO_SYNC_CROSS_DAY_WINDOW_HOURS = 4;
+const LINK_ROUTER_AUTO_SYNC_MAX_RUNTIME_MS = 25 * 60 * 1000;
+const LINK_ROUTER_MANUAL_AUTO_SYNC_MAX_RUNTIME_MS = 5 * 60 * 1000;
+const LINK_ROUTER_AUTO_SYNC_RUNTIME_BUFFER_MS = 20 * 1000;
+const LINK_ROUTER_AUTO_SYNC_STATE_KEY = 'LINK_ROUTER_AUTO_SYNC_STATE';
+const LINK_ROUTER_AUTO_SYNC_BATCH_SIZE = 2;
 
 function doGet() {
   return HtmlService.createTemplateFromFile('index')
@@ -281,14 +286,20 @@ function updateRevShare(payload) {
 
 function getDashboardData(params) {
   if (!params) throw new Error('Parâmetros inválidos.');
-  const snapshot = getConfigSnapshot_();
+  var runtimeCache = params.runtimeCache || null;
+  if (runtimeCache && !runtimeCache.routeResponses) {
+    runtimeCache.routeResponses = {};
+  }
+  const snapshot = params.snapshot || getConfigSnapshot_();
   const operationName = String(params.operation || '').trim();
   const trafficType = String(params.traffic || '').trim();
+  const operationKey = normalizeLookupKey_(operationName);
+  const trafficKey = normalizeLookupKey_(trafficType);
   if (!operationName) throw new Error('Selecione a operação.');
   if (!trafficType) throw new Error('Selecione o tráfego.');
   const requestedRouteSlug = String(params.routeSlug || '').trim();
   const requestedDomainId = String(params.domainId || '').trim();
-  const opTrafficKey = operationName + '\u0000' + trafficType;
+  const opTrafficKey = operationKey + '\u0000' + trafficKey;
   const integrationCandidates = (snapshot.operationIntegrationsByOperationTraffic && snapshot.operationIntegrationsByOperationTraffic[opTrafficKey]) ? snapshot.operationIntegrationsByOperationTraffic[opTrafficKey] : [];
   var integrationConfig = null;
   var selectedRouteSlug = requestedRouteSlug;
@@ -331,17 +342,18 @@ function getDashboardData(params) {
     selectedRouteSlug = '';
     selectedRouteDomainId = '';
   }
-  const operationUrls = snapshot.operationsByName[operationName];
+  const operationUrls = snapshot.operationsByName[operationKey];
   if (!operationUrls || !operationUrls.length) {
     throw new Error('Operação sem URLs configuradas.');
   }
-  const trafficSources = snapshot.trafficByType[trafficType] || [];
+  const trafficSources = snapshot.trafficByType[trafficKey] || [];
   if (!trafficSources.length) {
     throw new Error('Tráfego sem utm_source configurada.');
   }
   var startDate = params.startDate ? parseDate_(params.startDate) : null;
   var endDate = params.endDate ? parseDate_(params.endDate) : null;
   const window = params.urlWindow || 'day';
+  var cacheKey = [operationKey, trafficKey, window, startDate ? formatDateISO_(startDate) : '', endDate ? formatDateISO_(endDate) : ''].join('|');
   if (startDate && endDate && startDate.getTime() > endDate.getTime()) {
     throw new Error('A data inicial não pode ser maior que a final.');
   }
@@ -350,9 +362,17 @@ function getDashboardData(params) {
     startDate = today;
     endDate = today;
   }
+  var cached = runtimeCache && runtimeCache.dashboard && runtimeCache.dashboard[cacheKey];
   var routeLinkInfo = null;
   if (integrationConfig && integrationConfig.companyId && integrationConfig.domainId && integrationConfig.routeSlug) {
-    var routeResponse = fetchLinkRouterRoute_(integrationConfig.companyId, integrationConfig.domainId, integrationConfig.routeSlug);
+    var routeKey = integrationConfig.companyId + '\u0000' + integrationConfig.domainId + '\u0000' + integrationConfig.routeSlug;
+    var routeResponse = params.routeResponse || (runtimeCache && runtimeCache.routeResponses && runtimeCache.routeResponses[routeKey]);
+    if (!routeResponse) {
+      routeResponse = fetchLinkRouterRoute_(integrationConfig.companyId, integrationConfig.domainId, integrationConfig.routeSlug);
+      if (runtimeCache && runtimeCache.routeResponses) {
+        runtimeCache.routeResponses[routeKey] = routeResponse;
+      }
+    }
     if (routeResponse && routeResponse.ok && routeResponse.body && routeResponse.body.status === 'success') {
       var routeData = routeResponse.body.data || {};
       routeLinkInfo = buildLinkRouterUrlIndex_(routeData.links || []);
@@ -360,15 +380,15 @@ function getDashboardData(params) {
       Logger.log('[Link Router] Falha ao carregar rota "' + integrationConfig.routeSlug + '": ' + formatLinkRouterError_(routeResponse));
     }
   }
-  const baseRows = loadBaseData_(operationUrls, trafficSources);
+  var baseRows = cached ? cached.baseRows : loadBaseData_(operationUrls, trafficSources);
   if (!baseRows.length) {
     return buildEmptyDashboardResponse_();
   }
-  const filteredRows = filterRowsByDate_(baseRows, startDate, endDate);
+  var filteredRows = cached ? cached.filteredRows : filterRowsByDate_(baseRows, startDate, endDate);
   if (!filteredRows.length) {
     return buildEmptyDashboardResponse_();
   }
-  const hoursInfo = getHourTimeline_(filteredRows);
+  var hoursInfo = cached ? cached.hoursInfo : getHourTimeline_(filteredRows);
   if (!hoursInfo.allHours.length) {
     return buildEmptyDashboardResponse_();
   }
@@ -387,15 +407,29 @@ function getDashboardData(params) {
       return false;
     });
   }
-  const urlRows = filterRowsForWindow_(filteredRows, hoursInfo, window);
-  const siteSummary = buildSiteSummary_(
+  var urlRows = cached ? cached.urlRows : filterRowsForWindow_(filteredRows, hoursInfo, window);
+  var siteSummary = cached ? cached.siteSummary : buildSiteSummary_(
     filteredRows,
     hoursInfo,
     snapshot.revshareMap,
     urlRows
   );
-  const urlSummary = buildUrlSummary_(urlRows, snapshot.revshareMap);
-  const detailed = buildDetailedAnalysis_(filteredRows, hoursInfo, snapshot.revshareMap);
+  var urlSummary = cached ? cached.urlSummary : buildUrlSummary_(urlRows, snapshot.revshareMap);
+  var detailed = cached ? cached.detailed : buildDetailedAnalysis_(filteredRows, hoursInfo, snapshot.revshareMap);
+  if (!cached && runtimeCache) {
+    if (!runtimeCache.dashboard) {
+      runtimeCache.dashboard = {};
+    }
+    runtimeCache.dashboard[cacheKey] = {
+      baseRows: baseRows,
+      filteredRows: filteredRows,
+      hoursInfo: hoursInfo,
+      urlRows: urlRows,
+      siteSummary: siteSummary,
+      urlSummary: urlSummary,
+      detailed: detailed
+    };
+  }
 
   var savedControls = getDistributionControlsConfig_(operationName, trafficType, selectedRouteSlug, selectedRouteDomainId);
   var savedMinimums = getDistributionMinimumsConfig_(operationName, trafficType, selectedRouteSlug, selectedRouteDomainId);
@@ -2401,11 +2435,12 @@ function getConfigSnapshot_() {
   const revValues = getSheetValues_(revSheet);
 
   const operationRows = operationValues.rows.map(function (row) {
+    var operation = normalizeText_(row.operacao);
     return {
       id: row.id,
-      operation: row.operacao,
-      url: row.url,
-      note: row.observacao
+      operation: operation,
+      url: normalizeText_(row.url),
+      note: normalizeText_(row.observacao)
     };
   });
 
@@ -2413,19 +2448,25 @@ function getConfigSnapshot_() {
   operationRows.forEach(function (row) {
     var name = row.operation;
     if (!name) return;
-    if (!operationsByName[name]) operationsByName[name] = [];
-    operationsByName[name].push(row.url);
+    var opKey = normalizeLookupKey_(name);
+    if (!operationsByName[opKey]) operationsByName[opKey] = [];
+    operationsByName[opKey].push(row.url);
   });
 
   const operationIntegrationRows = operationIntegrationValues.rows.map(function (row) {
     var rawActive = row.ativo;
+    var operation = normalizeText_(row.operacao);
+    var trafficType = normalizeText_(row.tipotrafego);
+    var companyId = normalizeText_(row.empresaid);
+    var domainId = normalizeText_(row.dominioid);
+    var routeSlug = normalizeText_(row.slugrota);
     return {
       id: row.id,
-      operation: row.operacao,
-      trafficType: row.tipotrafego,
-      companyId: row.empresaid,
-      domainId: row.dominioid,
-      routeSlug: row.slugrota,
+      operation: operation,
+      trafficType: trafficType,
+      companyId: companyId,
+      domainId: domainId,
+      routeSlug: routeSlug,
       active: coerceBoolean_(rawActive)
     };
   });
@@ -2433,12 +2474,13 @@ function getConfigSnapshot_() {
   const operationIntegrationsByOperationTraffic = {};
   operationIntegrationRows.forEach(function (row) {
     if (!row.operation) return;
-    if (!operationIntegrationsByOperation[row.operation]) {
-      operationIntegrationsByOperation[row.operation] = [];
+    var opKey = normalizeLookupKey_(row.operation);
+    if (!operationIntegrationsByOperation[opKey]) {
+      operationIntegrationsByOperation[opKey] = [];
     }
-    operationIntegrationsByOperation[row.operation].push(row);
-    var trafficKey = row.trafficType || '';
-    var opTrafficKey = row.operation + '\u0000' + trafficKey;
+    operationIntegrationsByOperation[opKey].push(row);
+    var trafficKey = normalizeLookupKey_(row.trafficType);
+    var opTrafficKey = opKey + '\u0000' + trafficKey;
     if (!operationIntegrationsByOperationTraffic[opTrafficKey]) {
       operationIntegrationsByOperationTraffic[opTrafficKey] = [];
     }
@@ -2460,15 +2502,17 @@ function getConfigSnapshot_() {
   const trafficRows = trafficValues.rows.map(function (row) {
     return {
       id: row.id,
-      type: row.tipo,
-      source: row.utm_source
+      type: normalizeText_(row.tipo),
+      source: normalizeText_(row.utm_source)
     };
   });
   const trafficByType = {};
   trafficRows.forEach(function (row) {
-    if (!row.type || !row.source) return;
-    if (!trafficByType[row.type]) trafficByType[row.type] = [];
-    trafficByType[row.type].push(row.source);
+    var typeKey = normalizeLookupKey_(row.type);
+    var sourceValue = normalizeText_(row.source);
+    if (!typeKey || !sourceValue) return;
+    if (!trafficByType[typeKey]) trafficByType[typeKey] = [];
+    trafficByType[typeKey].push(sourceValue);
   });
 
   const revshareRows = revValues.rows.map(function (row) {
@@ -3261,6 +3305,14 @@ function normalizeKey_(value) {
     .replace(/[^a-z0-9]+/g, '');
 }
 
+function normalizeText_(value) {
+  return String(value == null ? '' : value).trim();
+}
+
+function normalizeLookupKey_(value) {
+  return normalizeText_(value).toLowerCase();
+}
+
 function pickValue_(row, idxMap, key) {
   if (!idxMap) return '';
   var index = idxMap[key];
@@ -3632,6 +3684,7 @@ function syncLinkRouterDistribution(request) {
   if (!request) {
     throw new Error('Parâmetros inválidos.');
   }
+  var runtimeCache = request.runtimeCache || null;
   var operation = String(request.operation || '').trim();
   var traffic = String(request.traffic || '').trim();
   var routeSlug = String(request.routeSlug || '').trim();
@@ -3649,7 +3702,9 @@ function syncLinkRouterDistribution(request) {
     domainId: domainId,
     startDate: request.startDate || '',
     endDate: request.endDate || '',
-    urlWindow: request.window || 'day'
+    urlWindow: request.window || 'day',
+    runtimeCache: runtimeCache,
+    routeResponse: request.routeResponse
   };
   if (request.distribution) {
     params.distribution = request.distribution;
@@ -3676,7 +3731,15 @@ function syncLinkRouterDistribution(request) {
   var historyOriginSuffix = executionMode === 'auto' ? ' (Execução automática)' : '';
 
   var shareState = buildLinkRouterShareState_(distribution);
-  var routeResponse = fetchLinkRouterRoute_(integration.companyId, integration.domainId, integration.routeSlug);
+  var routeKey = integration.companyId + '\u0000' + integration.domainId + '\u0000' + integration.routeSlug;
+  var routeCache = runtimeCache && runtimeCache.routeResponses ? runtimeCache.routeResponses : null;
+  var routeResponse = request.routeResponse || (routeCache && routeCache[routeKey]);
+  if (!routeResponse) {
+    routeResponse = fetchLinkRouterRoute_(integration.companyId, integration.domainId, integration.routeSlug);
+    if (routeResponse && routeCache) {
+      routeCache[routeKey] = routeResponse;
+    }
+  }
   if (!routeResponse.ok || !routeResponse.body || routeResponse.body.status !== 'success') {
     throw new Error('Falha ao consultar a rota na API: ' + formatLinkRouterError_(routeResponse));
   }
@@ -3792,7 +3855,14 @@ function parseLinkRouterId_(value) {
   return isNaN(num) ? value : num;
 }
 
-function runLinkRouterAutoSync() {
+function runLinkRouterAutoSync(options) {
+  options = options || {};
+  var maxRuntimeMs = Number(options.maxRuntimeMs) || LINK_ROUTER_AUTO_SYNC_MAX_RUNTIME_MS;
+  if (!isFinite(maxRuntimeMs) || maxRuntimeMs <= 0) {
+    maxRuntimeMs = LINK_ROUTER_AUTO_SYNC_MAX_RUNTIME_MS;
+  }
+  var forceRestart = !!options.forceRestart;
+
   var snapshot = getConfigSnapshot_();
   var integrations = (snapshot.operationIntegrationRows || []).filter(function (row) {
     return row && row.active && row.operation && row.companyId && row.domainId && row.routeSlug && row.trafficType;
@@ -3800,59 +3870,189 @@ function runLinkRouterAutoSync() {
   var trafficByType = snapshot.trafficByType || {};
   var successes = [];
   var failures = [];
+  var integrationVersion = buildLinkRouterIntegrationVersion_(integrations);
+  var state = forceRestart ? { nextIndex: 0, version: '' } : getLinkRouterAutoSyncState_();
+  var startIndex = state.version === integrationVersion ? Math.max(0, Number(state.nextIndex) || 0) : 0;
+  var startTime = new Date();
+  var continuationScheduled = false;
+  var lastIndexProcessed = startIndex - 1;
+  var runtimeCache = { routeResponses: {} };
 
-  integrations.forEach(function (integration) {
-    var trafficType = integration.trafficType;
-    var sources = trafficByType[trafficType] || [];
-    if (!sources.length) {
-      var error = new Error('Nenhuma utm_source configurada para o tráfego vinculado.');
-      failures.push({
-        operation: integration.operation,
-        traffic: trafficType,
-        message: error.message
-      });
-      logLinkRouterAutoSyncFailure_(integration, trafficType, error);
-      return;
+  var batchSize = Math.max(1, Number(LINK_ROUTER_AUTO_SYNC_BATCH_SIZE) || 1);
+  var i = startIndex;
+  while (i < integrations.length) {
+    var elapsedBeforeBatch = new Date().getTime() - startTime.getTime();
+    if (elapsedBeforeBatch >= Math.max(0, maxRuntimeMs - LINK_ROUTER_AUTO_SYNC_RUNTIME_BUFFER_MS)) {
+      scheduleLinkRouterAutoSyncContinuation_(i, integrationVersion);
+      continuationScheduled = true;
+      break;
     }
-    try {
+    var batch = integrations.slice(i, i + batchSize);
+    var runnable = [];
+
+    batch.forEach(function (integration, offset) {
+      var operationName = normalizeText_(integration.operation);
+      var trafficType = normalizeText_(integration.trafficType);
+      var trafficKey = normalizeLookupKey_(trafficType);
+      var domainId = normalizeText_(integration.domainId);
+      var routeSlug = normalizeText_(integration.routeSlug);
+      var normalizedIntegration = Object.assign({}, integration, {
+        operation: operationName,
+        trafficType: trafficType,
+        domainId: domainId,
+        routeSlug: routeSlug
+      });
+      var sources = trafficByType[trafficKey] || [];
+      if (!sources.length) {
+        var error = new Error('Nenhuma utm_source configurada para o tráfego vinculado.');
+        failures.push({
+          operation: operationName,
+          traffic: trafficType,
+          message: error.message
+        });
+        logLinkRouterAutoSyncFailure_(normalizedIntegration, trafficType, error);
+        lastIndexProcessed = i + offset;
+        return;
+      }
       var autoRange = getLinkRouterAutoSyncDateRange_();
       var request = {
-        operation: integration.operation,
+        operation: operationName,
         traffic: trafficType,
-        routeSlug: integration.routeSlug,
-        domainId: integration.domainId,
+        routeSlug: routeSlug,
+        domainId: domainId,
         window: 'day',
-        mode: 'auto'
+        mode: 'auto',
+        snapshot: snapshot,
+        runtimeCache: runtimeCache
       };
       if (autoRange) {
         request.startDate = autoRange.startDate;
         request.endDate = autoRange.endDate;
       }
-      var result = syncLinkRouterDistribution(request);
-      successes.push({
-        operation: integration.operation,
-        traffic: trafficType,
-        linksUpdated: result && result.linksUpdated ? result.linksUpdated : 0,
-        unmatchedLinks: result && result.unmatchedLinks ? result.unmatchedLinks.length : 0,
-        leftoverShares: result && result.leftoverShares ? result.leftoverShares.length : 0
+      runnable.push({
+        globalIndex: i + offset,
+        request: request,
+        normalizedIntegration: normalizedIntegration,
+        trafficType: trafficType
       });
-    } catch (err) {
-      failures.push({
-        operation: integration.operation,
-        traffic: trafficType,
-        message: err && err.message ? err.message : String(err)
+    });
+
+    if (runnable.length) {
+      var responses = fetchLinkRouterRoutesBatch_(runnable.map(function (item) {
+        return {
+          companyId: item.normalizedIntegration.companyId,
+          domainId: item.normalizedIntegration.domainId,
+          routeSlug: item.normalizedIntegration.routeSlug
+        };
+      }));
+
+      runnable.forEach(function (item, idx) {
+        if (continuationScheduled) {
+          return;
+        }
+        item.request.routeResponse = responses[idx];
+        var cacheKey = item.normalizedIntegration.companyId + '\u0000' + item.normalizedIntegration.domainId + '\u0000' + item.normalizedIntegration.routeSlug;
+        if (runtimeCache.routeResponses) {
+          runtimeCache.routeResponses[cacheKey] = responses[idx];
+        }
+        try {
+          var result = syncLinkRouterDistribution(item.request);
+          successes.push({
+            operation: item.request.operation,
+            traffic: item.request.traffic,
+            linksUpdated: result && result.linksUpdated ? result.linksUpdated : 0,
+            unmatchedLinks: result && result.unmatchedLinks ? result.unmatchedLinks.length : 0,
+            leftoverShares: result && result.leftoverShares ? result.leftoverShares.length : 0
+          });
+        } catch (err) {
+          failures.push({
+            operation: item.request.operation,
+            traffic: item.request.traffic,
+            message: err && err.message ? err.message : String(err)
+          });
+          logLinkRouterAutoSyncFailure_(item.normalizedIntegration, item.trafficType, err);
+        }
+
+        lastIndexProcessed = item.globalIndex;
+        var elapsed = new Date().getTime() - startTime.getTime();
+        if (elapsed >= Math.max(0, maxRuntimeMs - LINK_ROUTER_AUTO_SYNC_RUNTIME_BUFFER_MS) && item.globalIndex < integrations.length - 1) {
+          scheduleLinkRouterAutoSyncContinuation_(item.globalIndex + 1, integrationVersion);
+          continuationScheduled = true;
+          return;
+        }
       });
-      logLinkRouterAutoSyncFailure_(integration, trafficType, err);
     }
-  });
+
+    if (continuationScheduled) {
+      break;
+    }
+    lastIndexProcessed = Math.max(lastIndexProcessed, i + batch.length - 1);
+    i += batchSize;
+  }
+
+  if (!continuationScheduled) {
+    clearLinkRouterAutoSyncState_();
+  }
 
   updateLinkRouterAutoSyncTrigger_(snapshot);
 
   return {
     timestamp: new Date(),
     successes: successes,
-    failures: failures
+    failures: failures,
+    continuationScheduled: continuationScheduled,
+    remainingIntegrations: continuationScheduled ? Math.max(0, integrations.length - (lastIndexProcessed + 1)) : 0
   };
+}
+
+function startLinkRouterAutoSyncNow() {
+  clearLinkRouterAutoSyncState_();
+  var manualRuntimeCap = Math.min(LINK_ROUTER_AUTO_SYNC_MAX_RUNTIME_MS, LINK_ROUTER_MANUAL_AUTO_SYNC_MAX_RUNTIME_MS);
+  return runLinkRouterAutoSync({ forceRestart: true, maxRuntimeMs: manualRuntimeCap });
+}
+
+function buildLinkRouterIntegrationVersion_(integrations) {
+  if (!integrations || !integrations.length) {
+    return '';
+  }
+  return integrations.map(function (integration) {
+    var id = integration && integration.id ? String(integration.id).trim().toLowerCase() : '';
+    var slug = integration && integration.routeSlug ? String(integration.routeSlug).trim().toLowerCase() : '';
+    var op = integration && integration.operation ? String(integration.operation).trim().toLowerCase() : '';
+    var traffic = integration && integration.trafficType ? String(integration.trafficType).trim().toLowerCase() : '';
+    var domain = integration && integration.domainId ? String(integration.domainId).trim().toLowerCase() : '';
+    var company = integration && integration.companyId ? String(integration.companyId).trim().toLowerCase() : '';
+    return [id, slug, op, traffic, domain, company].join('|');
+  }).join('~');
+}
+
+function getLinkRouterAutoSyncState_() {
+  var raw = PropertiesService.getScriptProperties().getProperty(LINK_ROUTER_AUTO_SYNC_STATE_KEY);
+  if (!raw) {
+    return { nextIndex: 0, version: '' };
+  }
+  try {
+    var parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : { nextIndex: 0, version: '' };
+  } catch (err) {
+    return { nextIndex: 0, version: '' };
+  }
+}
+
+function scheduleLinkRouterAutoSyncContinuation_(nextIndex, integrationVersion) {
+  var state = {
+    nextIndex: Math.max(0, Number(nextIndex) || 0),
+    version: integrationVersion || ''
+  };
+  PropertiesService.getScriptProperties().setProperty(LINK_ROUTER_AUTO_SYNC_STATE_KEY, JSON.stringify(state));
+  ScriptApp.newTrigger('runLinkRouterAutoSync')
+    .timeBased()
+    .after(1 * 60 * 1000)
+    .create();
+}
+
+function clearLinkRouterAutoSyncState_() {
+  PropertiesService.getScriptProperties().deleteProperty(LINK_ROUTER_AUTO_SYNC_STATE_KEY);
 }
 
 function getLinkRouterAutoSyncDateRange_(now) {
@@ -4339,16 +4539,20 @@ function buildLinkRouterUrlIndex_(links) {
   };
 }
 
-function fetchLinkRouterRoute_(companyId, domainId, slug) {
+function fetchLinkRouterRoute_(companyId, domainId, slug, allowDomainFallback) {
   var params = {
     company_id: companyId,
     domain: domainId,
     slug: slug
   };
-  return callLinkRouterApi_('/api/link_router/route', 'get', params, null);
+  var response = callLinkRouterApi_('/api/link_router/route', 'get', params, null);
+  if (allowDomainFallback !== false && domainId && isLinkRouterDomainOwnershipError_(response)) {
+    response = callLinkRouterApi_('/api/link_router/route', 'get', { company_id: companyId, slug: slug }, null);
+  }
+  return response;
 }
 
-function callLinkRouterApi_(path, method, qs, payload) {
+function buildLinkRouterRequestOptions_(path, method, qs, payload) {
   var baseUrl = String(LINK_ROUTER_BASE_URL || '').replace(/\/+$/, '');
   var url = baseUrl + path;
   if (qs && Object.keys(qs).length) {
@@ -4371,12 +4575,10 @@ function callLinkRouterApi_(path, method, qs, payload) {
     options.payload = JSON.stringify(payload);
     options.contentType = 'application/json';
   }
-  var response;
-  try {
-    response = UrlFetchApp.fetch(url, options);
-  } catch (err) {
-    return { ok: false, statusCode: 0, body: { status: 'error', data: err && err.message ? err.message : String(err) } };
-  }
+  return { url: url, options: options };
+}
+
+function parseLinkRouterResponse_(response) {
   var statusCode = response.getResponseCode();
   var text = response.getContentText();
   var body;
@@ -4390,6 +4592,63 @@ function callLinkRouterApi_(path, method, qs, payload) {
     body.status = body.status || 'error';
   }
   return { ok: ok, statusCode: statusCode, body: body };
+}
+
+function isLinkRouterDomainOwnershipError_(response) {
+  var message = formatLinkRouterError_(response);
+  var normalized = normalizeLookupKey_(message);
+  if (!normalized) return false;
+  return normalized.indexOf('domain') >= 0 && (normalized.indexOf('pertence') >= 0 || normalized.indexOf('naopertence') >= 0);
+}
+
+function fetchLinkRouterRoutesBatch_(items) {
+  if (!items || !items.length) {
+    return [];
+  }
+  var responses = [];
+  var chunkSize = Math.min(10, Math.max(1, items.length));
+  for (var i = 0; i < items.length; i += chunkSize) {
+    var slice = items.slice(i, i + chunkSize);
+    var requests = slice.map(function (item) {
+      var params = { company_id: item.companyId, domain: item.domainId, slug: item.routeSlug };
+      var req = buildLinkRouterRequestOptions_('/api/link_router/route', 'get', params, null);
+      return Object.assign({ url: req.url }, req.options);
+    });
+    try {
+      var batchResponses = UrlFetchApp.fetchAll(requests).map(function (response) {
+        return parseLinkRouterResponse_(response);
+      });
+      responses = responses.concat(batchResponses);
+    } catch (err) {
+      var fallback = slice.map(function (item) {
+        try {
+          return callLinkRouterApi_('/api/link_router/route', 'get', { company_id: item.companyId, domain: item.domainId, slug: item.routeSlug }, null);
+        } catch (inner) {
+          return { ok: false, statusCode: 0, body: { status: 'error', data: inner && inner.message ? inner.message : String(inner) } };
+        }
+      });
+      responses = responses.concat(fallback);
+    }
+  }
+  responses = responses.map(function (response, idx) {
+    var item = items[idx];
+    if (!item || !item.domainId || !isLinkRouterDomainOwnershipError_(response)) {
+      return response;
+    }
+    return fetchLinkRouterRoute_(item.companyId, null, item.routeSlug, false);
+  });
+  return responses;
+}
+
+function callLinkRouterApi_(path, method, qs, payload) {
+  var req = buildLinkRouterRequestOptions_(path, method, qs, payload);
+  var response;
+  try {
+    response = UrlFetchApp.fetch(req.url, req.options);
+  } catch (err) {
+    return { ok: false, statusCode: 0, body: { status: 'error', data: err && err.message ? err.message : String(err) } };
+  }
+  return parseLinkRouterResponse_(response);
 }
 
 function buildLinkRouterHeaders_() {

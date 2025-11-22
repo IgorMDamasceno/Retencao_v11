@@ -417,9 +417,15 @@
           </div>
         </form>
         <div class="flex items-center justify-between gap-3 flex-wrap">
-          <label for="operacao-integracao-busca" class="text-xs uppercase tracking-wide text-slate-400">Filtrar</label>
-          <input id="operacao-integracao-busca" type="search" class="pill px-3 py-2 rounded-lg bg-slate-900/40 text-sm text-slate-100 w-full md:w-80" placeholder="Buscar por operação, IDs ou slug" />
+          <div class="flex items-center gap-3 flex-wrap">
+            <label for="operacao-integracao-busca" class="text-xs uppercase tracking-wide text-slate-400">Filtrar</label>
+            <input id="operacao-integracao-busca" type="search" class="pill px-3 py-2 rounded-lg bg-slate-900/40 text-sm text-slate-100 w-full md:w-80" placeholder="Buscar por operação, IDs ou slug" />
+          </div>
+          <button id="btn-rodar-auto-sync" class="inline-flex items-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-semibold px-4 py-2 rounded-xl shadow-lg shadow-emerald-900/40 transition-all">
+            <svg class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M4.5 12.75l6 6 9-13.5" /></svg>Atualizar rotas agora
+          </button>
         </div>
+        <p class="text-xs text-slate-400">Dispara imediatamente a atualização automática das rotas ativas e continua em segundo plano se ultrapassar o tempo máximo.</p>
         <div class="overflow-auto scroll-list-10">
           <table class="w-full text-sm min-w-full">
             <thead class="text-slate-400 text-left">
@@ -579,6 +585,7 @@
         detailedMetricMenuCleanup: null,
         analysis: null,
         syncingLinkRouter: false,
+        autoSyncingAllRoutes: false,
         integrationPrefillNoticeShown: false
       };
 
@@ -1059,6 +1066,14 @@
             salvarOperacaoIntegracao();
           });
         }
+        var autoSyncButton = document.getElementById('btn-rodar-auto-sync');
+        if (autoSyncButton) {
+          autoSyncButton.addEventListener('click', function (ev) {
+            ev.preventDefault();
+            dispararAutoSyncRotas();
+          });
+          updateAutoSyncButton();
+        }
         document.getElementById('form-trafego').addEventListener('submit', function (ev) {
           ev.preventDefault();
           salvarTrafego();
@@ -1151,6 +1166,57 @@
       function isIntegrationFormEditing() {
         var form = getIntegrationFormElement();
         return !!(form && form.dataset.mode === 'editing');
+      }
+
+      function updateAutoSyncButton() {
+        var button = document.getElementById('btn-rodar-auto-sync');
+        if (!button) return;
+        if (state.autoSyncingAllRoutes) {
+          button.disabled = true;
+          button.classList.add('opacity-60', 'cursor-not-allowed');
+          button.innerHTML = '<svg class="w-4 h-4 animate-spin" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M16.023 9.348h4.992m-5.614 3.72l3.536 3.536m-6.366-.964v4.992m-3.72-5.614l-3.536 3.536m.964-6.366H1.287m5.614-3.72L3.365 5.466m6.366.964V1.438m3.72 5.614l3.536-3.536" /></svg>Atualizando rotas...';
+        } else {
+          button.disabled = false;
+          button.classList.remove('opacity-60', 'cursor-not-allowed');
+          button.innerHTML = '<svg class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M4.5 12.75l6 6 9-13.5" /></svg>Atualizar rotas agora';
+        }
+      }
+
+      function dispararAutoSyncRotas() {
+        if (state.autoSyncingAllRoutes) {
+          return;
+        }
+        state.autoSyncingAllRoutes = true;
+        updateAutoSyncButton();
+        showLoading(true);
+        google.script.run
+          .withSuccessHandler(function (result) {
+            state.autoSyncingAllRoutes = false;
+            showLoading(false);
+            updateAutoSyncButton();
+            var successCount = (result && Array.isArray(result.successes)) ? result.successes.length : 0;
+            var failureCount = (result && Array.isArray(result.failures)) ? result.failures.length : 0;
+            var processed = successCount + failureCount;
+            var baseMessage = processed > 0
+              ? 'Atualização automática processou ' + processed + ' rota(s).'
+              : 'Nenhuma integração ativa para sincronizar no momento.';
+            showToast(baseMessage, processed > 0 ? 'success' : 'info');
+            if (failureCount > 0) {
+              showToast(failureCount + ' rota(s) falharam. Verifique o histórico para detalhes.', 'error');
+            }
+            if (result && result.continuationScheduled) {
+              var remaining = result.remainingIntegrations != null ? result.remainingIntegrations : '';
+              var remainingText = remaining !== '' ? ' (' + remaining + ' pendente(s))' : '';
+              showToast('Execução continuará automaticamente em instantes' + remainingText + '.', 'info');
+            }
+          })
+          .withFailureHandler(function (err) {
+            state.autoSyncingAllRoutes = false;
+            showLoading(false);
+            updateAutoSyncButton();
+            handleError(err);
+          })
+          .startLinkRouterAutoSyncNow();
       }
 
       function bindSearchInputs() {
